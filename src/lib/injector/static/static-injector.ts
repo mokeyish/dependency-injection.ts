@@ -1,0 +1,321 @@
+// noinspection ES6PreferShortImport
+import {
+    ConstructorProvider,
+    ExistingProvider, FactoryProvider,
+    StaticClassProvider,
+    StaticProvider,
+    ValueProvider
+} from '../../interface/provider';
+import {
+    catchInjectorError, formatError,
+    INJECTOR,
+    NG_TEMP_TOKEN_PATH,
+    setCurrentInjector,
+    USE_VALUE
+} from '../injector_compatibility';
+// noinspection ES6PreferShortImport
+import { Type } from '../../interface/type';
+import { InjectionToken } from '../../injection_token';
+// noinspection ES6PreferShortImport
+import { InjectFlags } from '../../interface/injector';
+import { getInjectableDef } from '../../interface/defs';
+import { stringify } from '../../util/stringify';
+import { resolveForwardRef } from '../../forward_ref';
+import { INJECTOR_SCOPE } from '../../scope';
+import { Inject, Optional, Self, SkipSelf } from '../../metadata';
+import { Injector } from '../injector';
+
+/**
+ * Created by yish on 2020/06/06.
+ */
+
+
+
+const IDENT = function<T>(value: T): T {
+    return value;
+};
+const EMPTY = [] as any[];
+const CIRCULAR = IDENT;
+const MULTI_PROVIDER_FN = function(): any[] {
+    return Array.prototype.slice.call(arguments);
+};
+
+const enum OptionFlags {
+    Optional = 1 << 0,
+    CheckSelf = 1 << 1,
+    CheckParent = 1 << 2,
+    Default = CheckSelf | CheckParent
+}
+const NO_NEW_LINE = 'ɵ';
+
+export class StaticInjector implements Injector {
+    readonly parent: Injector;
+    readonly source: string | null;
+    readonly scope: string | null;
+
+    private _records: Map<any, Record | null>;
+
+    constructor(
+        providers: StaticProvider[], parent: Injector = Injector.NULL, source: string | null = null) {
+        this.parent = parent;
+        this.source = source;
+        const records = this._records = new Map<any, Record>();
+        records.set(
+            Injector, { token: Injector, fn: IDENT, deps: EMPTY, value: this, useNew: false} as Record);
+        records.set(
+            INJECTOR, { token: INJECTOR, fn: IDENT, deps: EMPTY, value: this, useNew: false} as Record);
+        this.scope = recursivelyProcessProviders(records, providers);
+    }
+
+    get<T>(token: Type<T> | InjectionToken<T>, notFoundValue?: T, flags?: InjectFlags): T;
+    get(token: any, notFoundValue?: any): any;
+    get(token: any, notFoundValue?: any, flags: InjectFlags = InjectFlags.Default): any {
+        const records = this._records;
+        let record = records.get(token);
+        if (record === undefined) {
+            // This means we have never seen this record, see if it is tree shakable provider.
+            const injectableDef = getInjectableDef(token);
+            if (injectableDef) {
+                const providedIn = injectableDef && injectableDef.providedIn;
+                if (providedIn === 'any' || providedIn != null && providedIn === this.scope) {
+                    records.set(
+                        token,
+                        record = resolveProvider(
+                            { provide: token, useFactory: injectableDef.factory, deps: EMPTY}));
+                }
+            }
+            if (record === undefined) {
+                // Set record to null to make sure that we don't go through expensive lookup above again.
+                records.set(token, null);
+            }
+        }
+        const lastInjector = setCurrentInjector(this);
+        try {
+            return tryResolveToken(token, record, records, this.parent, notFoundValue, flags);
+        } catch (e) {
+            return catchInjectorError(e, token, 'StaticInjectorError', this.source);
+        } finally {
+            setCurrentInjector(lastInjector);
+        }
+    }
+
+    toString() {
+        const tokens = [] as string[]
+        const records = this._records;
+        records.forEach((v, token) => tokens.push(stringify(token)));
+        return `StaticInjector[${tokens.join(', ')}]`;
+    }
+}
+
+type SupportedProvider =
+    ValueProvider | ExistingProvider | StaticClassProvider | ConstructorProvider | FactoryProvider;
+
+interface Record {
+    fn: Function;
+    useNew: boolean;
+    deps: DependencyRecord[];
+    value: any;
+}
+
+interface DependencyRecord {
+    token: any;
+    options: number;
+}
+
+function resolveProvider(provider: SupportedProvider): Record {
+    const deps = computeDeps(provider);
+    let fn: Function = IDENT;
+    let value: any = EMPTY;
+    let useNew: boolean = false;
+    const provide = resolveForwardRef(provider.provide);
+    if (USE_VALUE in provider) {
+        // We need to use USE_VALUE in provider since provider.useValue could be defined as undefined.
+        value = (provider as ValueProvider).useValue;
+    } else if ((provider as FactoryProvider).useFactory) {
+        fn = (provider as FactoryProvider).useFactory;
+    } else if ((provider as ExistingProvider).useExisting) {
+        // Just use IDENT
+    } else if ((provider as StaticClassProvider).useClass) {
+        useNew = true;
+        fn = resolveForwardRef((provider as StaticClassProvider).useClass);
+    } else if (typeof provide === 'function') {
+        useNew = true;
+        fn = provide;
+    } else {
+        throw staticError(
+            'StaticProvider does not have [useValue|useFactory|useExisting|useClass] or [provide] is not newable',
+            provider);
+    }
+    return { deps, fn, useNew, value};
+}
+
+function multiProviderMixError(token: any) {
+    return staticError('Cannot mix multi providers and regular providers', token);
+}
+
+function recursivelyProcessProviders(records: Map<any, Record>, provider: StaticProvider): string |
+    null {
+    let scope: string | null = null;
+    if (provider) {
+        provider = resolveForwardRef(provider);
+        if (Array.isArray(provider)) {
+            // if we have an array recurse into the array
+            for (let i = 0; i < provider.length; i++) {
+                scope = recursivelyProcessProviders(records, provider[i]) || scope;
+            }
+        } else if (typeof provider === 'function') {
+            // Functions were supported in ReflectiveInjector, but are not here. For safety give useful
+            // error messages
+            throw staticError('Function/Class not supported', provider);
+        } else if (provider && typeof provider === 'object' && provider.provide) {
+            // At this point we have what looks like a provider: {provide: ?, ....}
+            let token = resolveForwardRef(provider.provide);
+            const resolvedProvider = resolveProvider(provider);
+            if (provider.multi === true) {
+                // This is a multi provider.
+                let multiProvider: Record | undefined = records.get(token);
+                if (multiProvider) {
+                    if (multiProvider.fn !== MULTI_PROVIDER_FN) {
+                        throw multiProviderMixError(token);
+                    }
+                } else {
+                    // Create a placeholder factory which will look up the constituents of the multi provider.
+                    records.set(token, multiProvider = ({
+                        token: provider.provide,
+                        deps: [],
+                        useNew: false,
+                        fn: MULTI_PROVIDER_FN,
+                        value: EMPTY
+                    } as Record));
+                }
+                // Treat the provider as the token.
+                token = provider;
+                multiProvider.deps.push({ token, options: OptionFlags.Default});
+            }
+            const record = records.get(token);
+            if (record && record.fn === MULTI_PROVIDER_FN) {
+                throw multiProviderMixError(token);
+            }
+            if (token === INJECTOR_SCOPE) {
+                scope = resolvedProvider.value;
+            }
+            records.set(token, resolvedProvider);
+        } else {
+            throw staticError('Unexpected provider', provider);
+        }
+    }
+    return scope;
+}
+
+function tryResolveToken(
+    token: any, record: Record | undefined | null, records: Map<any, Record | null>, parent: Injector,
+    notFoundValue: any, flags: InjectFlags): any {
+    try {
+        return resolveToken(token, record, records, parent, notFoundValue, flags);
+    } catch (e) {
+        // ensure that 'e' is of type Error.
+        if (!(e instanceof Error)) {
+            e = new Error(e);
+        }
+        const path: any[] = e[NG_TEMP_TOKEN_PATH] = e[NG_TEMP_TOKEN_PATH] || [];
+        path.unshift(token);
+        if (record && record.value === CIRCULAR) {
+            // Reset the Circular flag.
+            record.value = EMPTY;
+        }
+        throw e;
+    }
+}
+
+function resolveToken(
+    token: any, record: Record | undefined | null, records: Map<any, Record | null>, parent: Injector,
+    notFoundValue: any, flags: InjectFlags): any {
+    let value;
+    if (record && !(flags & InjectFlags.SkipSelf)) {
+        // If we don't have a record, this implies that we don't own the provider hence don't know how
+        // to resolve it.
+        value = record.value;
+        if (value === CIRCULAR) {
+            throw Error(NO_NEW_LINE + 'Circular dependency');
+        } else if (value === EMPTY) {
+            record.value = CIRCULAR;
+            // tslint:disable-next-line:prefer-const
+            let obj;
+            const useNew = record.useNew;
+            const fn = record.fn;
+            const depRecords = record.deps;
+            let deps = EMPTY;
+            if (depRecords.length) {
+                deps = [];
+                for (let i = 0; i < depRecords.length; i++) {
+                    const depRecord: DependencyRecord = depRecords[i];
+                    const options = depRecord.options;
+                    const childRecord =
+                        options & OptionFlags.CheckSelf ? records.get(depRecord.token) : undefined;
+                    deps.push(tryResolveToken(
+                        // Current Token to resolve
+                        depRecord.token,
+                        // A record which describes how to resolve the token.
+                        // If undefined, this means we don't have such a record
+                        childRecord,
+                        // Other records we know about.
+                        records,
+                        // If we don't know how to resolve dependency and we should not check parent for it,
+                        // than pass in Null injector.
+                        !childRecord && !(options & OptionFlags.CheckParent) ? Injector.NULL : parent,
+                        options & OptionFlags.Optional ? null : Injector.THROW_IF_NOT_FOUND,
+                        InjectFlags.Default));
+                }
+            }
+            record.value = value = useNew ? new (fn as any)(...deps) : fn.apply(obj, deps);
+        }
+    } else if (!(flags & InjectFlags.Self)) {
+        value = parent.get(token, notFoundValue, InjectFlags.Default);
+    } else if (!(flags & InjectFlags.Optional)) {
+        value = Injector.NULL.get(token, notFoundValue);
+    } else {
+        value = Injector.NULL.get(token, typeof notFoundValue !== 'undefined' ? notFoundValue : null);
+    }
+    return value;
+}
+
+function computeDeps(provider: StaticProvider): DependencyRecord[] {
+    let deps: DependencyRecord[] = EMPTY;
+    const providerDeps: any[] =
+        (provider as ExistingProvider & StaticClassProvider & ConstructorProvider).deps;
+    if (providerDeps && providerDeps.length) {
+        deps = [];
+        for (let i = 0; i < providerDeps.length; i++) {
+            let options = OptionFlags.Default;
+            let token = resolveForwardRef(providerDeps[i]);
+            if (Array.isArray(token)) {
+                for (let j = 0, annotations = token; j < annotations.length; j++) {
+                    const annotation = annotations[j];
+                    if (annotation instanceof Optional || annotation === Optional) {
+                        options = options | OptionFlags.Optional;
+                    } else if (annotation instanceof SkipSelf || annotation === SkipSelf) {
+                        options = options & ~OptionFlags.CheckSelf;
+                    } else if (annotation instanceof Self || annotation === Self) {
+                        options = options & ~OptionFlags.CheckParent;
+                    } else if (annotation instanceof Inject) {
+                        token = (annotation as Inject).token;
+                    } else {
+                        token = resolveForwardRef(annotation);
+                    }
+                }
+            }
+            deps.push({ token, options});
+        }
+    } else if ((provider as ExistingProvider).useExisting) {
+        const token = resolveForwardRef((provider as ExistingProvider).useExisting);
+        deps = [{ token, options: OptionFlags.Default}];
+    } else if (!providerDeps && !(USE_VALUE in provider)) {
+        // useValue & useExisting are the only ones which are exempt from deps all others need it.
+        throw staticError('\'deps\' required', provider);
+    }
+    return deps;
+}
+
+function staticError(text: string, obj: any): Error {
+    return new Error(formatError(text, obj, 'StaticInjectorError'));
+}
